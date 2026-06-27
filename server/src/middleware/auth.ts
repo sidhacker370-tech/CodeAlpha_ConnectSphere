@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
+import { supabase } from '../services/supabase';
 import prisma from '../services/db';
 
 export interface AuthenticatedRequest extends Request {
@@ -14,51 +14,47 @@ export const authenticate = async (req: AuthenticatedRequest, res: Response, nex
   }
 
   const token = authHeader.substring(7);
-  let decodedToken: any = null;
+  let userId: string | undefined = undefined;
+  let email: string | undefined = undefined;
+  let name: string | undefined = undefined;
 
   try {
     // If it's a dev fallback mock token (starts with JSON structure)
     if (process.env.NODE_ENV === 'development' && token.startsWith('{')) {
       try {
-        decodedToken = JSON.parse(token);
+        const decodedToken = JSON.parse(token);
+        userId = decodedToken.uid || decodedToken.sub;
+        email = decodedToken.email;
+        name = decodedToken.name || decodedToken.user_metadata?.name || decodedToken.user_metadata?.full_name || email?.split('@')[0] || 'ConnectSphere User';
       } catch (e) {
         // Not valid JSON, let it fall through to normal verify
       }
     }
 
-    if (!decodedToken) {
-      const jwtSecret = process.env.SUPABASE_JWT_SECRET;
-      if (!jwtSecret) {
-        console.error('SUPABASE_JWT_SECRET environment variable is not defined.');
-        return res.status(500).json({ message: 'Server configuration error' });
+    if (!userId) {
+      // Verify token with Supabase Auth service
+      const { data: { user }, error } = await supabase.auth.getUser(token);
+      if (error || !user) {
+        console.error('Supabase token verification failed:', error?.message || 'User not found');
+        return res.status(401).json({ message: 'Invalid or expired access token', error: error?.message });
       }
-      const rawDecoded = jwt.decode(token, { complete: true });
-      console.log('--- Incoming Token Header ---', rawDecoded?.header);
-      console.log('--- Incoming Token Payload ---', rawDecoded?.payload);
-      decodedToken = jwt.verify(token, jwtSecret, { algorithms: ['HS256'] });
+      userId = user.id;
+      email = user.email;
+      name = user.user_metadata?.name || user.user_metadata?.full_name || email?.split('@')[0] || 'ConnectSphere User';
     }
   } catch (error: any) {
-    console.error('Supabase token verification failed:', error);
+    console.error('Token verification exception:', error);
     return res.status(401).json({ message: 'Invalid or expired access token', error: error.message });
   }
 
-  if (!decodedToken) {
-    return res.status(401).json({ message: 'Invalid token claims' });
-  }
-
-  // Handle differences between Dev Mock Token (uid/email/name) and Supabase JWT (sub/email/user_metadata)
-  const uid = decodedToken.sub || decodedToken.uid;
-  const email = decodedToken.email;
-  const name = decodedToken.user_metadata?.name || decodedToken.user_metadata?.full_name || decodedToken.name || email?.split('@')[0] || 'ConnectSphere User';
-
-  if (!uid) {
+  if (!userId) {
     return res.status(401).json({ message: 'Invalid token claims: missing user identifier' });
   }
 
   try {
     // Sync with database: find or create user
     let user = await prisma.user.findUnique({
-      where: { id: uid },
+      where: { id: userId },
     });
 
     if (!user) {
@@ -70,13 +66,13 @@ export const authenticate = async (req: AuthenticatedRequest, res: Response, nex
         // Create new user record using Supabase details
         user = await prisma.user.create({
           data: {
-            id: uid,
-            email: email || `${uid}@connectsphere.local`,
-            name: name,
+            id: userId,
+            email: email || `${userId}@connectsphere.local`,
+            name: name || 'ConnectSphere User',
             password: 'supabase-authenticated-user-placeholder-password',
           },
         });
-        console.log(`Successfully auto-synced Supabase user ${uid} to database.`);
+        console.log(`Successfully auto-synced Supabase user ${userId} to database.`);
       }
     }
 
