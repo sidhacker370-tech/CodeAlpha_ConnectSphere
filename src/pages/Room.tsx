@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useRoomStore } from '../store/roomStore';
 import { useAuthStore } from '../store/authStore';
 import { useWebRTC } from '../hooks/useWebRTC';
-import api from '../services/api';
+import { supabase } from '../config/supabase';
 import Whiteboard from '../components/Whiteboard';
 import MeetingChat from '../components/MeetingChat';
 import FileShare from '../components/FileShare';
@@ -147,10 +147,21 @@ export const Room = () => {
     if (!roomCode) return;
     const loadRoomData = async () => {
       try {
-        const res = await api.get(`/rooms/${roomCode}`);
-        setRoom(res.data.id, res.data.roomCode);
+        const { data: room, error: roomError } = await supabase
+          .from('Room')
+          .select('id, roomCode')
+          .eq('roomCode', roomCode?.toLowerCase() || '')
+          .maybeSingle();
+
+        if (roomError) throw roomError;
+        if (!room) {
+          setDbError('Room not found or invalid code');
+          return;
+        }
+
+        setRoom(room.id, room.roomCode);
       } catch (err: any) {
-        setDbError(err.response?.data?.message || 'Room initialization failed');
+        setDbError(err.message || 'Room initialization failed');
       }
     };
     loadRoomData();

@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
-import api from '../services/api';
+import { supabase } from '../config/supabase';
 import {
   LogOut,
   Video,
@@ -46,45 +46,193 @@ export const Dashboard = () => {
 
   useEffect(() => {
     const fetchHistory = async () => {
+      if (!user) return;
       try {
-        const res = await api.get('/auth/history');
-        setHistory(res.data);
-      } catch (err) {
+        const { data: hostedRooms, error: hostError } = await supabase
+          .from('Room')
+          .select(`
+            id,
+            roomCode,
+            hostId,
+            createdAt,
+            host:User(id, name, email),
+            participants:Participant(
+              id,
+              user:User(name)
+            )
+          `)
+          .eq('hostId', user.id);
+
+        if (hostError) throw hostError;
+
+        const { data: participations, error: partError } = await supabase
+          .from('Participant')
+          .select('roomId')
+          .eq('userId', user.id);
+
+        if (partError) throw partError;
+
+        const joinedRoomIds = participations?.map((p: any) => p.roomId) || [];
+
+        let joinedRooms: any[] = [];
+        if (joinedRoomIds.length > 0) {
+          const { data: rooms, error: roomsError } = await supabase
+            .from('Room')
+            .select(`
+              id,
+              roomCode,
+              hostId,
+              createdAt,
+              host:User(id, name, email),
+              participants:Participant(
+                id,
+                user:User(name)
+              )
+            `)
+            .in('id', joinedRoomIds);
+
+          if (roomsError) throw roomsError;
+          joinedRooms = rooms || [];
+        }
+
+        const allRooms = [...(hostedRooms || []), ...joinedRooms]
+          .filter((room, index, self) => self.findIndex(r => r.id === room.id) === index)
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+        const formattedHistory: Meeting[] = allRooms.map((room: any) => ({
+          id: room.id,
+          roomCode: room.roomCode,
+          hostId: room.hostId,
+          createdAt: room.createdAt,
+          host: {
+            id: room.host?.id || '',
+            name: room.host?.name || '',
+            email: room.host?.email || '',
+          },
+          participants: (room.participants || []).map((p: any) => ({
+            id: p.id,
+            user: {
+              name: p.user?.name || '',
+            },
+          })),
+        }));
+
+        setHistory(formattedHistory);
+      } catch (err: any) {
         console.error('Failed to fetch meeting history:', err);
       } finally {
         setIsLoadingHistory(false);
       }
     };
     fetchHistory();
-  }, []);
+  }, [user]);
+
+  const generateRoomCode = () => {
+    const chars = 'abcdefghijklmnopqrstuvwxyz';
+    let part1 = '';
+    let part2 = '';
+    let part3 = '';
+    for (let i = 0; i < 3; i++) part1 += chars[Math.floor(Math.random() * chars.length)];
+    for (let i = 0; i < 4; i++) part2 += chars[Math.floor(Math.random() * chars.length)];
+    for (let i = 0; i < 3; i++) part3 += chars[Math.floor(Math.random() * chars.length)];
+    return `${part1}-${part2}-${part3}`;
+  };
 
   const handleCreateMeeting = async () => {
+    if (!user) return;
     setActionError('');
     setIsCreating(true);
     try {
-      const res = await api.post('/rooms/create');
-      const { roomCode } = res.data.room;
+      let roomCode = generateRoomCode();
+      let { data: existingRoom } = await supabase
+        .from('Room')
+        .select('id')
+        .eq('roomCode', roomCode)
+        .maybeSingle();
+
+      while (existingRoom) {
+        roomCode = generateRoomCode();
+        const { data } = await supabase
+          .from('Room')
+          .select('id')
+          .eq('roomCode', roomCode)
+          .maybeSingle();
+        existingRoom = data;
+      }
+
+      const { data: room, error: roomError } = await supabase
+        .from('Room')
+        .insert({
+          roomCode,
+          hostId: user.id,
+        })
+        .select()
+        .single();
+
+      if (roomError) throw roomError;
+
+      const { error: partError } = await supabase
+        .from('Participant')
+        .insert({
+          userId: user.id,
+          roomId: room.id,
+        });
+
+      if (partError) throw partError;
+
       navigate(`/room/${roomCode}`);
     } catch (err: any) {
-      setActionError(err.response?.data?.message || 'Failed to create meeting');
+      setActionError(err.message || 'Failed to create meeting');
       setIsCreating(false);
     }
   };
 
   const handleJoinMeeting = async (e: FormEvent) => {
     e.preventDefault();
+    if (!user) return;
     setActionError('');
     if (!roomCode.trim()) {
       setActionError('Please enter a meeting code');
       return;
     }
 
+    const formattedCode = roomCode.trim().toLowerCase();
+
     try {
-      const res = await api.post('/rooms/join', { roomCode });
-      const code = res.data.room.roomCode;
-      navigate(`/room/${code}`);
+      const { data: room, error: roomError } = await supabase
+        .from('Room')
+        .select('*')
+        .eq('roomCode', formattedCode)
+        .maybeSingle();
+
+      if (roomError) throw roomError;
+      if (!room) {
+        setActionError('Room not found or invalid code');
+        return;
+      }
+
+      const { data: existingParticipant, error: partCheckError } = await supabase
+        .from('Participant')
+        .select('*')
+        .eq('userId', user.id)
+        .eq('roomId', room.id)
+        .maybeSingle();
+
+      if (partCheckError) throw partCheckError;
+
+      if (!existingParticipant) {
+        const { error: joinError } = await supabase
+          .from('Participant')
+          .insert({
+            userId: user.id,
+            roomId: room.id,
+          });
+        if (joinError) throw joinError;
+      }
+
+      navigate(`/room/${room.roomCode}`);
     } catch (err: any) {
-      setActionError(err.response?.data?.message || 'Room not found or invalid code');
+      setActionError(err.message || 'Room not found or invalid code');
     }
   };
 

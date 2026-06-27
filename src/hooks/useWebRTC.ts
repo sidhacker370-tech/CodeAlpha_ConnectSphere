@@ -1,9 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import io, { type Socket } from 'socket.io-client';
+import { supabase } from '../config/supabase';
 import { useRoomStore } from '../store/roomStore';
 import { useAuthStore } from '../store/authStore';
-
-const SOCKET_SERVER_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 
 const getIceServers = () => {
   const customIce = import.meta.env.VITE_ICE_SERVERS;
@@ -44,10 +42,18 @@ export const useWebRTC = (roomCode: string) => {
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
 
-  const socketRef = useRef<Socket | null>(null);
   const peersRef = useRef<Record<string, RTCPeerConnection>>({});
   const localStreamRef = useRef<MediaStream | null>(null);
   const audioAnalyzersRef = useRef<Record<string, { stop: () => void }>>({});
+  const channelRef = useRef<any>(null);
+  const listenersRef = useRef<Record<string, Function[]>>({});
+
+  const triggerEvent = (event: string, data: any) => {
+    const list = listenersRef.current[event];
+    if (list) {
+      list.forEach((cb) => cb(data));
+    }
+  };
 
   const createMockStream = useCallback(() => {
     const canvas = document.createElement('canvas');
@@ -214,10 +220,15 @@ export const useWebRTC = (roomCode: string) => {
     });
 
     pc.onicecandidate = (event) => {
-      if (event.candidate && socketRef.current) {
-        socketRef.current.emit('webrtc-candidate', {
-          toSocketId: targetSocketId,
-          candidate: event.candidate,
+      if (event.candidate && channelRef.current && user) {
+        channelRef.current.send({
+          type: 'broadcast',
+          event: 'webrtc-candidate',
+          payload: {
+            toSocketId: targetSocketId,
+            fromSocketId: user.id,
+            candidate: event.candidate,
+          },
         });
       }
     };
@@ -239,106 +250,162 @@ export const useWebRTC = (roomCode: string) => {
     };
 
     return pc;
-  }, [cleanupPeer, setupAudioAnalyzer]);
+  }, [cleanupPeer, setupAudioAnalyzer, user]);
 
   useEffect(() => {
     if (!roomCode || !user) return;
 
     let localStreamInst: MediaStream;
+    let channel: any;
 
     const startCall = async () => {
       localStreamInst = await initLocalStream();
 
-      const socket = io(SOCKET_SERVER_URL, {
-        withCredentials: true,
-      });
-      socketRef.current = socket;
-
-      socket.emit('join-room', {
-        roomCode,
-        userId: user.id,
-        userName: user.name,
+      channel = supabase.channel(`room:${roomCode}`, {
+        config: {
+          presence: {
+            key: user.id,
+          },
+        },
       });
 
-      socket.on('room-users', (users) => {
+      channelRef.current = channel;
+
+      channel.on('presence', { event: 'sync' }, () => {
+        const state = channel.presenceState();
+        const users = Object.values(state)
+          .flat()
+          .map((p: any) => ({
+            socketId: p.userId,
+            userId: p.userId,
+            userName: p.userName,
+          }));
         setParticipants(users);
       });
 
-      socket.on('user-joined', async ({ socketId, userId, userName }) => {
-        addParticipant({ socketId, userId, userName });
+      channel.on('presence', { event: 'join' }, ({ newPresences }: { newPresences: any }) => {
+        newPresences.forEach(async (p: any) => {
+          if (p.userId !== user.id) {
+            addParticipant({ socketId: p.userId, userId: p.userId, userName: p.userName });
 
-        const pc = createPeerConnection(socketId, localStreamInst);
-        
-        try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit('webrtc-offer', {
-            toSocketId: socketId,
-            sdp: offer,
-          });
-        } catch (err) {
-          console.error('Failed to create offer:', err);
-        }
+            const pc = createPeerConnection(p.userId, localStreamInst);
+            try {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              
+              channel.send({
+                type: 'broadcast',
+                event: 'webrtc-offer',
+                payload: {
+                  toSocketId: p.userId,
+                  fromSocketId: user.id,
+                  sdp: offer,
+                },
+              });
+            } catch (err) {
+              console.error('Failed to create offer:', err);
+            }
+          }
+        });
       });
 
-      socket.on('webrtc-offer', async ({ fromSocketId, sdp }) => {
-        const pc = createPeerConnection(fromSocketId, localStreamInst);
-        
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          
-          socket.emit('webrtc-answer', {
-            toSocketId: fromSocketId,
-            sdp: answer,
-          });
-        } catch (err) {
-          console.error('Failed to answer offer:', err);
-        }
+      channel.on('presence', { event: 'leave' }, ({ leftPresences }: { leftPresences: any }) => {
+        leftPresences.forEach((p: any) => {
+          if (p.userId !== user.id) {
+            cleanupPeer(p.userId);
+          }
+        });
       });
 
-      socket.on('webrtc-answer', async ({ fromSocketId, sdp }) => {
-        const pc = peersRef.current[fromSocketId];
-        if (pc) {
+      channel.on('broadcast', { event: 'webrtc-offer' }, async ({ payload }: { payload: any }) => {
+        if (payload.toSocketId === user.id) {
+          const pc = createPeerConnection(payload.fromSocketId, localStreamInst);
           try {
-            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            channel.send({
+              type: 'broadcast',
+              event: 'webrtc-answer',
+              payload: {
+                toSocketId: payload.fromSocketId,
+                fromSocketId: user.id,
+                sdp: answer,
+              },
+            });
           } catch (err) {
-            console.error('Failed to set remote description from answer:', err);
+            console.error('Failed to answer offer:', err);
           }
         }
       });
 
-      socket.on('webrtc-candidate', async ({ fromSocketId, candidate }) => {
-        const pc = peersRef.current[fromSocketId];
-        if (pc) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          } catch (err) {
-            console.error('Failed to add remote ICE candidate:', err);
+      channel.on('broadcast', { event: 'webrtc-answer' }, async ({ payload }: { payload: any }) => {
+        if (payload.toSocketId === user.id) {
+          const pc = peersRef.current[payload.fromSocketId];
+          if (pc) {
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            } catch (err) {
+              console.error('Failed to set remote description from answer:', err);
+            }
           }
         }
       });
 
-      socket.on('user-left', ({ socketId }) => {
-        cleanupPeer(socketId);
+      channel.on('broadcast', { event: 'webrtc-candidate' }, async ({ payload }: { payload: any }) => {
+        if (payload.toSocketId === user.id) {
+          const pc = peersRef.current[payload.fromSocketId];
+          if (pc) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+            } catch (err) {
+              console.error('Failed to add remote ICE candidate:', err);
+            }
+          }
+        }
       });
 
-      socket.on('new-message', (msg) => {
-        addMessage(msg);
+      channel.on('broadcast', { event: 'new-message' }, ({ payload }: { payload: any }) => {
+        addMessage(payload);
       });
 
-      socket.on('file-shared', (file) => {
-        addSharedFile(file);
+      channel.on('broadcast', { event: 'file-shared' }, ({ payload }: { payload: any }) => {
+        addSharedFile(payload);
+      });
+
+      channel.on('broadcast', { event: 'draw-line' }, ({ payload }: { payload: any }) => {
+        triggerEvent('draw-line', payload);
+      });
+
+      channel.on('broadcast', { event: 'clear-canvas' }, () => {
+        triggerEvent('clear-canvas', null);
+      });
+
+      channel.on('broadcast', { event: 'screen-share-started' }, ({ payload }: { payload: any }) => {
+        triggerEvent('screen-share-started', payload);
+      });
+
+      channel.on('broadcast', { event: 'screen-share-stopped' }, ({ payload }: { payload: any }) => {
+        triggerEvent('screen-share-stopped', payload);
+      });
+
+      channel.subscribe(async (status: any) => {
+        if (status === 'SUBSCRIBED') {
+          await channel.track({
+            userId: user.id,
+            userName: user.name,
+            socketId: user.id,
+          });
+        }
       });
     };
 
     startCall();
 
     return () => {
-      if (socketRef.current) {
-        socketRef.current.emit('leave-room', { roomCode });
-        socketRef.current.disconnect();
+      if (channel) {
+        channel.unsubscribe();
       }
 
       Object.keys(peersRef.current).forEach((id) => cleanupPeer(id));
@@ -356,7 +423,6 @@ export const useWebRTC = (roomCode: string) => {
     };
   }, [roomCode, user, addMessage, addParticipant, addSharedFile, createPeerConnection, initLocalStream, setParticipants, cleanupPeer]);
 
-  // Handle local mute state change reactively
   useEffect(() => {
     if (localStream) {
       const audioTrack = localStream.getAudioTracks()[0];
@@ -366,7 +432,6 @@ export const useWebRTC = (roomCode: string) => {
     }
   }, [audioEnabled, localStream]);
 
-  // Handle local camera state change reactively
   useEffect(() => {
     if (localStream) {
       const videoTrack = localStream.getVideoTracks()[0];
@@ -376,7 +441,6 @@ export const useWebRTC = (roomCode: string) => {
     }
   }, [videoEnabled, localStream]);
 
-  // Start / Stop screen share track substitution
   const shareScreen = useCallback(async () => {
     if (isScreenSharing) {
       if (screenStream) {
@@ -392,7 +456,11 @@ export const useWebRTC = (roomCode: string) => {
         });
       }
       setScreenSharing(false);
-      socketRef.current?.emit('screen-share-stopped', { roomCode });
+      channelRef.current?.send({
+        type: 'broadcast',
+        event: 'screen-share-stopped',
+        payload: { userId: user?.id },
+      });
     } else {
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
@@ -414,46 +482,85 @@ export const useWebRTC = (roomCode: string) => {
               if (sender) sender.replaceTrack(camTrack);
             });
           }
-          socketRef.current?.emit('screen-share-stopped', { roomCode });
+          channelRef.current?.send({
+            type: 'broadcast',
+            event: 'screen-share-stopped',
+            payload: { userId: user?.id },
+          });
         };
 
         setScreenStream(stream);
         setScreenSharing(true);
-        socketRef.current?.emit('screen-share-started', { roomCode });
+        channelRef.current?.send({
+          type: 'broadcast',
+          event: 'screen-share-started',
+          payload: { userId: user?.id },
+        });
       } catch (err) {
         console.error('Screen sharing acquisition failed:', err);
       }
     }
-  }, [isScreenSharing, screenStream, localStream, roomCode, setScreenSharing]);
+  }, [isScreenSharing, screenStream, localStream, roomCode, setScreenSharing, user]);
 
   const sendSocketMessage = useCallback((content: string, senderId: string, senderName: string) => {
-    socketRef.current?.emit('send-message', {
-      roomCode,
+    const msgData = {
+      id: Math.random().toString(36).substring(7),
       content,
       senderId,
       senderName,
+      createdAt: new Date().toISOString(),
+    };
+    addMessage(msgData);
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'new-message',
+      payload: msgData,
     });
-  }, [roomCode]);
+  }, [addMessage]);
 
   const sendDrawingStroke = useCallback((stroke: any) => {
-    socketRef.current?.emit('draw-line', {
-      roomCode,
-      drawing: stroke,
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'draw-line',
+      payload: stroke,
     });
-  }, [roomCode]);
+  }, []);
 
   const sendClearDrawing = useCallback(() => {
-    socketRef.current?.emit('clear-canvas', {
-      roomCode,
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'clear-canvas',
+      payload: {},
     });
-  }, [roomCode]);
+  }, []);
 
   const emitFileShared = useCallback((file: any) => {
-    socketRef.current?.emit('file-shared', {
-      roomCode,
-      file,
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'file-shared',
+      payload: file,
     });
-  }, [roomCode]);
+  }, []);
+
+  const socketMock = {
+    on: (event: string, cb: Function) => {
+      if (!listenersRef.current[event]) listenersRef.current[event] = [];
+      listenersRef.current[event].push(cb);
+    },
+    off: (event: string, cb: Function) => {
+      if (!listenersRef.current[event]) return;
+      listenersRef.current[event] = listenersRef.current[event].filter((x) => x !== cb);
+    },
+    emit: (event: string, data: any) => {
+      if (event === 'draw-line') {
+        sendDrawingStroke(data.drawing);
+      } else if (event === 'clear-canvas') {
+        sendClearDrawing();
+      } else if (event === 'file-shared') {
+        emitFileShared(data.file);
+      }
+    },
+  };
 
   return {
     localStream,
@@ -464,6 +571,6 @@ export const useWebRTC = (roomCode: string) => {
     sendDrawingStroke,
     sendClearDrawing,
     emitFileShared,
-    socket: socketRef.current,
+    socket: socketMock as any,
   };
 };

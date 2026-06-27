@@ -1,5 +1,4 @@
 import { create } from 'zustand';
-import api from '../services/api';
 import { supabase } from '../config/supabase';
 
 interface User {
@@ -36,9 +35,24 @@ export const useAuthStore = create<AuthState>((set) => {
     const existingToken = localStorage.getItem('accessToken');
     if (existingToken && existingToken.startsWith('{')) {
       try {
-        const res = await api.get('/auth/profile');
+        const decodedToken = JSON.parse(existingToken);
+        const devId = decodedToken.uid || decodedToken.sub;
+        const devEmail = decodedToken.email;
+        const devName = decodedToken.name || 'Developer';
+        
+        let { data: devUser } = await supabase.from('User').select('*').eq('id', devId).maybeSingle();
+        if (!devUser) {
+          const { data: newUser } = await supabase.from('User').insert({
+            id: devId,
+            email: devEmail,
+            name: devName,
+            password: 'dev-login-bypass-placeholder-password',
+          }).select().single();
+          devUser = newUser;
+        }
+
         set({ 
-          user: res.data, 
+          user: devUser, 
           isAuthenticated: true, 
           isLoading: false,
           error: null 
@@ -60,10 +74,24 @@ export const useAuthStore = create<AuthState>((set) => {
         const token = session.access_token;
         localStorage.setItem('accessToken', token);
         
-        // Fetch/sync user profile from local backend database
-        const res = await api.get('/auth/profile');
+        const userId = session.user.id;
+        const userEmail = session.user.email || '';
+        const userName = session.user.user_metadata?.name || session.user.user_metadata?.full_name || userEmail.split('@')[0] || 'ConnectSphere User';
+
+        let { data: dbUser } = await supabase.from('User').select('*').eq('id', userId).maybeSingle();
+        if (!dbUser) {
+          const { data: newUser, error: insertError } = await supabase.from('User').insert({
+            id: userId,
+            email: userEmail,
+            name: userName,
+            password: 'supabase-authenticated-user-placeholder-password',
+          }).select().single();
+          if (insertError) throw insertError;
+          dbUser = newUser;
+        }
+
         set({ 
-          user: res.data, 
+          user: dbUser, 
           isAuthenticated: true, 
           isLoading: false,
           error: null 
@@ -170,10 +198,20 @@ export const useAuthStore = create<AuthState>((set) => {
         const token = JSON.stringify(mockUser);
         localStorage.setItem('accessToken', token);
         
-        // Fetch/sync user profile from local backend database
-        const res = await api.get('/auth/profile');
+        let { data: devUser } = await supabase.from('User').select('*').eq('id', mockUser.uid).maybeSingle();
+        if (!devUser) {
+          const { data: newUser, error: insertError } = await supabase.from('User').insert({
+            id: mockUser.uid,
+            email: devEmail,
+            name: devName,
+            password: 'dev-login-bypass-placeholder-password',
+          }).select().single();
+          if (insertError) throw insertError;
+          devUser = newUser;
+        }
+
         set({ 
-          user: res.data, 
+          user: devUser, 
           isAuthenticated: true, 
           isLoading: false,
           error: null 
@@ -181,7 +219,7 @@ export const useAuthStore = create<AuthState>((set) => {
       } catch (err: any) {
         localStorage.removeItem('accessToken');
         set({
-          error: 'Dev Login Bypass failed. Verify backend server is running.',
+          error: 'Dev Login Bypass failed.',
           isLoading: false,
         });
         throw err;
@@ -191,7 +229,6 @@ export const useAuthStore = create<AuthState>((set) => {
     logout: async () => {
       set({ isLoading: true });
       try {
-        // If we are currently logged in with a dev mock token, just clear localStorage directly!
         const existingToken = localStorage.getItem('accessToken');
         if (existingToken && existingToken.startsWith('{')) {
           localStorage.removeItem('accessToken');

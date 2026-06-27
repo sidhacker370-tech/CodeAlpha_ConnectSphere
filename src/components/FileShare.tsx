@@ -1,6 +1,7 @@
 import { useState, useEffect, type FormEvent, type ChangeEvent } from 'react';
 import { Upload, Download, FileText, Image, AlertCircle, FileCode } from 'lucide-react';
-import api from '../services/api';
+import { supabase } from '../config/supabase';
+import { useAuthStore } from '../store/authStore';
 import { useRoomStore, type SharedFile } from '../store/roomStore';
 
 interface FileShareProps {
@@ -9,6 +10,7 @@ interface FileShareProps {
 
 export const FileShare = ({ emitFileShared }: FileShareProps) => {
   const { roomId, sharedFiles, setSharedFiles, addSharedFile } = useRoomStore();
+  const { user } = useAuthStore();
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState('');
@@ -17,9 +19,41 @@ export const FileShare = ({ emitFileShared }: FileShareProps) => {
     if (!roomId) return;
     const fetchFiles = async () => {
       try {
-        const res = await api.get(`/files/room/${roomId}`);
-        setSharedFiles(res.data);
-      } catch (err) {
+        const { data: files, error: fetchError } = await supabase
+          .from('SharedFile')
+          .select(`
+            id,
+            roomId,
+            fileUrl,
+            fileName,
+            fileSize,
+            mimeType,
+            uploadedBy,
+            uploader:User(id, name)
+          `)
+          .eq('roomId', roomId)
+          .order('createdAt', { ascending: true });
+
+        if (fetchError) throw fetchError;
+
+        const formattedFiles: SharedFile[] = (files || []).map((f: any) => {
+          const uploaderObj = Array.isArray(f.uploader) ? f.uploader[0] : f.uploader;
+          return {
+            id: f.id,
+            roomId: f.roomId,
+            fileUrl: f.fileUrl,
+            fileName: f.fileName,
+            uploadedBy: f.uploadedBy,
+            uploader: {
+              id: uploaderObj?.id || '',
+              name: uploaderObj?.name || 'Unknown User',
+            },
+            createdAt: f.createdAt,
+          };
+        });
+
+        setSharedFiles(formattedFiles);
+      } catch (err: any) {
         console.error('Failed to fetch room files:', err);
       }
     };
@@ -40,31 +74,70 @@ export const FileShare = ({ emitFileShared }: FileShareProps) => {
 
   const handleUpload = async (e: FormEvent) => {
     e.preventDefault();
-    if (!file || !roomId) return;
+    if (!file || !roomId || !user) return;
 
     setUploading(true);
     setError('');
 
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('roomId', roomId);
-
     try {
-      const res = await api.post('/files/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
+      const fileExt = file.name.split('.').pop();
+      const uniqueFileName = `${roomId}/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
       
-      const newFile = res.data.file;
-      addSharedFile(newFile);
+      const { error: uploadError } = await supabase.storage
+        .from('shared-files')
+        .upload(uniqueFileName, file);
+
+      if (uploadError) throw uploadError;
+
+      const { data: { publicUrl } } = supabase.storage
+        .from('shared-files')
+        .getPublicUrl(uniqueFileName);
+
+      const { data: newDbFile, error: dbError } = await supabase
+        .from('SharedFile')
+        .insert({
+          roomId,
+          fileUrl: publicUrl,
+          fileName: file.name,
+          fileSize: file.size,
+          mimeType: file.type || 'application/octet-stream',
+          uploadedBy: user.id,
+        })
+        .select(`
+          id,
+          roomId,
+          fileUrl,
+          fileName,
+          uploadedBy,
+          uploader:User(id, name),
+          createdAt
+        `)
+        .single();
+
+      if (dbError) throw dbError;
+
+      const uploaderObj = Array.isArray(newDbFile.uploader) ? newDbFile.uploader[0] : newDbFile.uploader;
+      const formattedFile: SharedFile = {
+        id: newDbFile.id,
+        roomId: newDbFile.roomId,
+        fileUrl: newDbFile.fileUrl,
+        fileName: newDbFile.fileName,
+        uploadedBy: newDbFile.uploadedBy,
+        uploader: {
+          id: uploaderObj?.id || user.id,
+          name: uploaderObj?.name || user.name,
+        },
+        createdAt: newDbFile.createdAt,
+      };
+
+      addSharedFile(formattedFile);
       
-      // Notify other peers via socket
-      emitFileShared(newFile);
+      emitFileShared(formattedFile);
       setFile(null);
-      // Reset input element
       const fileInput = document.getElementById('file-input') as HTMLInputElement;
       if (fileInput) fileInput.value = '';
     } catch (err: any) {
-      setError(err.response?.data?.message || 'Failed to upload file');
+      setError(err.message || 'Failed to upload file');
     } finally {
       setUploading(false);
     }
@@ -123,7 +196,7 @@ export const FileShare = ({ emitFileShared }: FileShareProps) => {
               </div>
 
               <a
-                href={`http://localhost:5000${file.fileUrl}`}
+                href={file.fileUrl.startsWith('http') ? file.fileUrl : `http://localhost:5000${file.fileUrl}`}
                 target="_blank"
                 rel="noreferrer"
                 download
