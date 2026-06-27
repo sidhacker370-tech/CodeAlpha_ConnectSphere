@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { auth } from '../config/firebase';
+import { supabase } from '../config/supabase';
 
 const API_URL = import.meta.env.VITE_API_URL 
   ? `${import.meta.env.VITE_API_URL}/api` 
@@ -31,9 +31,9 @@ api.interceptors.response.use(
     if (error.response?.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true;
       try {
-        const user = auth.currentUser;
-        if (user) {
-          const accessToken = await user.getIdToken(true);
+        const { data } = await supabase.auth.getSession();
+        if (data.session) {
+          const accessToken = data.session.access_token;
           localStorage.setItem('accessToken', accessToken);
           originalRequest.headers.Authorization = `Bearer ${accessToken}`;
           return api(originalRequest);

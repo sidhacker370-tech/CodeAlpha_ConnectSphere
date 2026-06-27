@@ -1,14 +1,6 @@
 import { create } from 'zustand';
 import api from '../services/api';
-import { auth, googleProvider } from '../config/firebase';
-import {
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-  signOut,
-  signInWithPopup,
-  updateProfile,
-  onIdTokenChanged
-} from 'firebase/auth';
+import { supabase } from '../config/supabase';
 
 interface User {
   id: string;
@@ -38,8 +30,8 @@ const initPromise = new Promise<void>((resolve) => {
 export const useAuthStore = create<AuthState>((set) => {
   let isInitialized = false;
 
-  // Listen for Firebase Auth state changes
-  onIdTokenChanged(auth, async (firebaseUser) => {
+  // Listen for Supabase Auth state changes
+  supabase.auth.onAuthStateChange(async (_event, session) => {
     // 1. Check if there is an existing dev mock token in localStorage
     const existingToken = localStorage.getItem('accessToken');
     if (existingToken && existingToken.startsWith('{')) {
@@ -62,10 +54,10 @@ export const useAuthStore = create<AuthState>((set) => {
       return;
     }
 
-    // 2. Otherwise use standard Firebase listener logic
-    if (firebaseUser) {
+    // 2. Otherwise use standard Supabase listener logic
+    if (session) {
       try {
-        const token = await firebaseUser.getIdToken();
+        const token = session.access_token;
         localStorage.setItem('accessToken', token);
         
         // Fetch/sync user profile from local backend database
@@ -86,8 +78,12 @@ export const useAuthStore = create<AuthState>((set) => {
         });
       }
     } else {
-      localStorage.removeItem('accessToken');
-      set({ user: null, isAuthenticated: false, isLoading: false });
+      // Only clear if we aren't in dev mode bypass (dev tokens are JSON strings)
+      const currentToken = localStorage.getItem('accessToken');
+      if (!currentToken || !currentToken.startsWith('{')) {
+        localStorage.removeItem('accessToken');
+        set({ user: null, isAuthenticated: false, isLoading: false });
+      }
     }
     
     if (!isInitialized) {
@@ -105,7 +101,8 @@ export const useAuthStore = create<AuthState>((set) => {
     login: async ({ email, password }) => {
       set({ isLoading: true, error: null });
       try {
-        await signInWithEmailAndPassword(auth, email, password);
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
       } catch (err: any) {
         set({
           error: err.message || 'Login failed. Check credentials.',
@@ -118,12 +115,18 @@ export const useAuthStore = create<AuthState>((set) => {
     register: async ({ name, email, password }) => {
       set({ isLoading: true, error: null });
       try {
-        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-        if (userCredential.user) {
-          await updateProfile(userCredential.user, { displayName: name });
-          // Force token refresh to make sure displayName is in token claims
-          const token = await userCredential.user.getIdToken(true);
-          localStorage.setItem('accessToken', token);
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            data: {
+              name: name,
+            },
+          },
+        });
+        if (error) throw error;
+        if (data.session) {
+          localStorage.setItem('accessToken', data.session.access_token);
         }
       } catch (err: any) {
         set({
@@ -137,7 +140,13 @@ export const useAuthStore = create<AuthState>((set) => {
     googleLogin: async () => {
       set({ isLoading: true, error: null });
       try {
-        await signInWithPopup(auth, googleProvider);
+        const { error } = await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: window.location.origin + '/dashboard',
+          },
+        });
+        if (error) throw error;
       } catch (err: any) {
         set({
           error: err.message || 'Google Sign-In failed.',
@@ -189,7 +198,10 @@ export const useAuthStore = create<AuthState>((set) => {
           set({ user: null, isAuthenticated: false, isLoading: false });
           return;
         }
-        await signOut(auth);
+        const { error } = await supabase.auth.signOut();
+        if (error) throw error;
+        localStorage.removeItem('accessToken');
+        set({ user: null, isAuthenticated: false, isLoading: false });
       } catch (err: any) {
         console.error('Logout error:', err);
         set({ isLoading: false, error: err.message });

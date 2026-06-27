@@ -12,7 +12,7 @@ export const Register = () => {
   const { register, googleLogin, devLogin, error, isLoading, clearError } = useAuthStore();
   const navigate = useNavigate();
 
-  const isFirebaseConfigured = !import.meta.env.VITE_FIREBASE_API_KEY || import.meta.env.VITE_FIREBASE_API_KEY === "dummy-api-key" ? false : true;
+  const isSupabaseConfigured = !import.meta.env.VITE_SUPABASE_URL || import.meta.env.VITE_SUPABASE_URL === "https://your-project.supabase.co" ? false : true;
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -35,7 +35,7 @@ export const Register = () => {
     }
 
     try {
-      if (!isFirebaseConfigured) {
+      if (!isSupabaseConfigured) {
         await devLogin(name, email);
       } else {
         await register({ name, email, password });
@@ -50,7 +50,7 @@ export const Register = () => {
     setFormError('');
     clearError();
     try {
-      if (!isFirebaseConfigured) {
+      if (!isSupabaseConfigured) {
         await devLogin("Google Developer", "google-developer@connectsphere.local");
       } else {
         await googleLogin();
@@ -102,9 +102,9 @@ export const Register = () => {
             <span>Create Account</span>
           </h2>
 
-          {!isFirebaseConfigured && (
+          {!isSupabaseConfigured && (
             <div className="mb-6 rounded-2xl border border-amber-550/10 bg-amber-500/5 p-4 text-sm text-amber-400 text-left">
-              <p className="font-semibold mb-1 text-amber-300">Firebase API Key not set</p>
+              <p className="font-semibold mb-1 text-amber-300">Supabase Configuration not set</p>
               <p className="text-xs text-gray-455 mb-3 leading-relaxed">
                 ConnectSphere is running in demo mode. Update your environment variables or click below to bypass registration.
               </p>

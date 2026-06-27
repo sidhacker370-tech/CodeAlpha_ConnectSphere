@@ -7,7 +7,6 @@ import rateLimit from 'express-rate-limit';
 import path from 'path';
 
 import { config } from './config';
-import './config/firebase';
 import authRoutes from './routes/auth';
 import roomRoutes from './routes/room';
 import fileRoutes from './routes/file';

@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { getAuth } from '../config/firebase';
+import jwt from 'jsonwebtoken';
 import prisma from '../services/db';
 
 export interface AuthenticatedRequest extends Request {
@@ -27,18 +27,30 @@ export const authenticate = async (req: AuthenticatedRequest, res: Response, nex
     }
 
     if (!decodedToken) {
-      decodedToken = await getAuth().verifyIdToken(token);
+      const jwtSecret = process.env.SUPABASE_JWT_SECRET;
+      if (!jwtSecret) {
+        console.error('SUPABASE_JWT_SECRET environment variable is not defined.');
+        return res.status(500).json({ message: 'Server configuration error' });
+      }
+      decodedToken = jwt.verify(token, jwtSecret);
     }
   } catch (error: any) {
-    console.error('Firebase token verification failed:', error);
+    console.error('Supabase token verification failed:', error);
     return res.status(401).json({ message: 'Invalid or expired access token', error: error.message });
   }
 
-  if (!decodedToken || !decodedToken.uid) {
+  if (!decodedToken) {
     return res.status(401).json({ message: 'Invalid token claims' });
   }
 
-  const { uid, email, name } = decodedToken;
+  // Handle differences between Dev Mock Token (uid/email/name) and Supabase JWT (sub/email/user_metadata)
+  const uid = decodedToken.sub || decodedToken.uid;
+  const email = decodedToken.email;
+  const name = decodedToken.user_metadata?.name || decodedToken.user_metadata?.full_name || decodedToken.name || email?.split('@')[0] || 'ConnectSphere User';
+
+  if (!uid) {
+    return res.status(401).json({ message: 'Invalid token claims: missing user identifier' });
+  }
 
   try {
     // Sync with database: find or create user
@@ -52,16 +64,16 @@ export const authenticate = async (req: AuthenticatedRequest, res: Response, nex
       if (existingUserByEmail) {
         user = existingUserByEmail;
       } else {
-        // Create new user record using Firebase details
+        // Create new user record using Supabase details
         user = await prisma.user.create({
           data: {
             id: uid,
             email: email || `${uid}@connectsphere.local`,
-            name: name || email?.split('@')[0] || 'ConnectSphere User',
-            password: 'firebase-authenticated-user-placeholder-password',
+            name: name,
+            password: 'supabase-authenticated-user-placeholder-password',
           },
         });
-        console.log(`Successfully auto-synced Firebase user ${uid} to database.`);
+        console.log(`Successfully auto-synced Supabase user ${uid} to database.`);
       }
     }
 
