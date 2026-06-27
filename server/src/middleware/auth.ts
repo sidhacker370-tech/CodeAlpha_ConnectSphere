@@ -32,7 +32,10 @@ export const authenticate = async (req: AuthenticatedRequest, res: Response, nex
         console.error('SUPABASE_JWT_SECRET environment variable is not defined.');
         return res.status(500).json({ message: 'Server configuration error' });
       }
-      decodedToken = jwt.verify(token, jwtSecret);
+      const rawDecoded = jwt.decode(token, { complete: true });
+      console.log('--- Incoming Token Header ---', rawDecoded?.header);
+      console.log('--- Incoming Token Payload ---', rawDecoded?.payload);
+      decodedToken = jwt.verify(token, jwtSecret, { algorithms: ['HS256'] });
     }
   } catch (error: any) {
     console.error('Supabase token verification failed:', error);
